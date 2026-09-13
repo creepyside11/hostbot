@@ -33,16 +33,23 @@ def check_once():
             continue
         with connect() as conn:
             with conn.transaction():
-                bot = conn.execute('SELECT id,github_last_sha,github_last_attempt_sha,auto_update,desired FROM bots WHERE id=%s FOR UPDATE', (row['id'],)).fetchone()
+                bot = conn.execute('SELECT id,status,github_last_sha,github_last_attempt_sha,auto_update,desired FROM bots WHERE id=%s FOR UPDATE', (row['id'],)).fetchone()
                 if not bot or not bot['auto_update'] or bot['desired'] != 'running':
                     continue
                 conn.execute('UPDATE bots SET github_last_check=now() WHERE id=%s', (row['id'],))
+                busy = conn.execute("SELECT 1 FROM jobs WHERE bot_id=%s AND state IN ('pending','active')", (row['id'],)).fetchone()
                 if not bot['github_last_sha']:
                     conn.execute('UPDATE bots SET github_last_sha=%s,github_last_attempt_sha=NULL WHERE id=%s', (current_sha,row['id']))
                     continue
-                if current_sha == bot['github_last_sha'] or current_sha == bot['github_last_attempt_sha']:
+                if current_sha == bot['github_last_sha']:
+                    if bot['github_last_attempt_sha']:
+                        conn.execute('UPDATE bots SET github_last_attempt_sha=NULL WHERE id=%s', (row['id'],))
                     continue
-                busy = conn.execute("SELECT 1 FROM jobs WHERE bot_id=%s AND state IN ('pending','active')", (row['id'],)).fetchone()
+                if current_sha == bot['github_last_attempt_sha']:
+                    if not busy and bot['status'] == 'running':
+                        conn.execute('UPDATE bots SET github_last_sha=%s,github_last_attempt_sha=NULL WHERE id=%s', (current_sha,row['id']))
+                    # Failed deploy keeps github_last_attempt_sha, so this exact commit is not retried forever.
+                    continue
                 if busy:
                     continue
                 conn.execute("UPDATE bots SET github_last_attempt_sha=%s,status='deploying',updated_at=now() WHERE id=%s", (current_sha,row['id']))
