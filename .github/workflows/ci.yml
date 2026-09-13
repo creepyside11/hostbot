@@ -13,4 +13,4 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m py_compile main.py runner.py docker_backend.py github_worker.py github_watch.py private_repo_patch.py sqlite_inspector.py launcher.py
+      - run: python -m py_compile main.py runner.py docker_backend.py github_worker.py github_watch.py private_repo_patch.py sqlite_inspector.py db_connection.py launcher.py
