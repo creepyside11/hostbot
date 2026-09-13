@@ -11,6 +11,12 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS github_login text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS github_user_id bigint;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS github_scope text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS github_connected_at timestamptz;
+CREATE TABLE IF NOT EXISTS github_webhook_updates(
+ bot_id uuid PRIMARY KEY REFERENCES bots(id) ON DELETE CASCADE,
+ sha text NOT NULL,
+ received_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS github_webhook_updates_received ON github_webhook_updates(received_at);
 CREATE TABLE IF NOT EXISTS sqlite_requests(
  id uuid PRIMARY KEY,
  bot_id uuid NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
