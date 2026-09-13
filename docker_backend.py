@@ -2,6 +2,7 @@
 import io
 import os
 import re
+import tarfile
 import time
 
 
@@ -102,16 +103,32 @@ class DockerBackend:
         finally:
             events.close()
         self.client.images.get(self.tag(bot_id))
-    def _template_volumes(self, bot_id, template_id):
-        if template_id != 'funpay-cardinal':
-            return {}
-        volumes = {}
+    def _existing_template_volumes(self, bot_id):
+        volumes={}
+        try:
+            found=self.client.volumes.list(filters={'label':f'emerald.bot={bot_id}'})
+        except Exception:
+            found=[]
+        for volume in found:
+            labels=volume.attrs.get('Labels') or {}
+            if labels.get('emerald.namespace')!=self.namespace:
+                continue
+            folder=labels.get('emerald.folder')
+            if folder in {'configs','logs','storage','plugins'}:
+                volumes[volume.name]={'bind':f'/app/{folder}','mode':'rw'}
+        return volumes
+    def _template_volumes(self, bot_id, template_id=None):
+        existing=self._existing_template_volumes(bot_id)
+        if existing or template_id!='funpay-cardinal':
+            return existing
+        volumes={}
         for folder in ('configs','logs','storage','plugins'):
             name=f'{self.namespace}-{bot_id.replace("-","")[:16]}-{folder}'
+            labels={'emerald.bot':bot_id,'emerald.namespace':self.namespace,'emerald.template':template_id,'emerald.folder':folder}
             try:
                 volume=self.client.volumes.get(name)
             except Exception:
-                volume=self.client.volumes.create(name=name,labels={'emerald.bot':bot_id,'emerald.namespace':self.namespace,'emerald.template':template_id})
+                volume=self.client.volumes.create(name=name,labels=labels)
             volumes[volume.name]={'bind':f'/app/{folder}','mode':'rw'}
         return volumes
     def start(self, bot_id, env, template_id=None, setup=False):
@@ -125,6 +142,17 @@ class DockerBackend:
                     mem_limit=os.getenv('DOCKER_BOT_MEMORY','256m'),nano_cpus=1000000000,pids_limit=128,
                     restart_policy={'Name':'no'},log_config=LogConfig(type='json-file',config={'max-size':'5m','max-file':'2'}))
         return DockerProcess(container)
+    def put_text(self, bot_id, path, text):
+        container=self._container(bot_id)
+        directory,filename=os.path.split(path)
+        payload=io.BytesIO()
+        raw=str(text).encode('utf-8')
+        with tarfile.open(fileobj=payload,mode='w') as archive:
+            info=tarfile.TarInfo(filename);info.size=len(raw);info.mode=0o600
+            archive.addfile(info,io.BytesIO(raw))
+        payload.seek(0)
+        if not container.put_archive(directory or '/',payload.read()):
+            raise RuntimeError('Не удалось добавить setup helper в контейнер.')
     def open_terminal(self, bot_id):
         container=self._container(bot_id)
         result=container.exec_run(['/bin/sh'],stdin=True,stdout=True,stderr=True,tty=True,socket=True,
@@ -141,7 +169,7 @@ class DockerBackend:
             pass
         try:
             for volume in self.client.volumes.list(filters={'label': f'emerald.bot={bot_id}'}):
-                if volume.attrs.get('Labels',{}).get('emerald.namespace')==self.namespace:
+                if (volume.attrs.get('Labels') or {}).get('emerald.namespace')==self.namespace:
                     try: volume.remove(force=True)
                     except Exception: pass
         except Exception:
