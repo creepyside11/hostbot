@@ -62,6 +62,18 @@ class DockerBackend:
         return self.namespace + '-' + bot_id
     def tag(self, bot_id):
         return self.namespace + ':' + bot_id
+    def _container(self, bot_id):
+        import docker
+        try:
+            container = self.client.containers.get(self.name(bot_id))
+        except docker.errors.NotFound:
+            raise RuntimeError('Контейнер проекта не запущен.') from None
+        if container.labels.get('emerald.bot') != bot_id or container.labels.get('emerald.namespace') != self.namespace:
+            raise RuntimeError('Имя Docker-контейнера занято другим проектом.')
+        container.reload()
+        if not container.attrs.get('State', {}).get('Running'):
+            raise RuntimeError('Контейнер проекта остановлен.')
+        return container
     def stop_existing(self, bot_id):
         import docker
         try:
@@ -90,19 +102,47 @@ class DockerBackend:
         finally:
             events.close()
         self.client.images.get(self.tag(bot_id))
-    def start(self, bot_id, env):
+    def _template_volumes(self, bot_id, template_id):
+        if template_id != 'funpay-cardinal':
+            return {}
+        volumes = {}
+        for folder in ('configs','logs','storage','plugins'):
+            name=f'{self.namespace}-{bot_id.replace("-","")[:16]}-{folder}'
+            try:
+                volume=self.client.volumes.get(name)
+            except Exception:
+                volume=self.client.volumes.create(name=name,labels={'emerald.bot':bot_id,'emerald.namespace':self.namespace,'emerald.template':template_id})
+            volumes[volume.name]={'bind':f'/app/{folder}','mode':'rw'}
+        return volumes
+    def start(self, bot_id, env, template_id=None, setup=False):
         from docker.types import LogConfig
         self.stop_existing(bot_id)
-        container=self.client.containers.run(self.tag(bot_id),detach=True,name=self.name(bot_id),
-                    environment=env,labels={'emerald.bot':bot_id,'emerald.namespace':self.namespace},
+        command=['sh','-lc','while :; do sleep 3600; done'] if setup else None
+        container=self.client.containers.run(self.tag(bot_id),command=command,detach=True,name=self.name(bot_id),
+                    environment=env,volumes=self._template_volumes(bot_id,template_id),
+                    labels={'emerald.bot':bot_id,'emerald.namespace':self.namespace,'emerald.template':template_id or ''},
                     init=True,cap_drop=['ALL'],security_opt=['no-new-privileges:true'],
                     mem_limit=os.getenv('DOCKER_BOT_MEMORY','256m'),nano_cpus=1000000000,pids_limit=128,
                     restart_policy={'Name':'no'},log_config=LogConfig(type='json-file',config={'max-size':'5m','max-file':'2'}))
         return DockerProcess(container)
+    def open_terminal(self, bot_id):
+        container=self._container(bot_id)
+        result=container.exec_run(['/bin/sh'],stdin=True,stdout=True,stderr=True,tty=True,socket=True,
+                                  environment={'TERM':'xterm-256color','LANG':'C.UTF-8'},workdir='/app')
+        if not result.output:
+            raise RuntimeError('Не удалось открыть PTY контейнера.')
+        return result.output
     def delete(self, bot_id):
         import docker
         self.stop_existing(bot_id)
         try:
             self.client.images.remove(self.tag(bot_id))
         except docker.errors.ImageNotFound:
+            pass
+        try:
+            for volume in self.client.volumes.list(filters={'label': f'emerald.bot={bot_id}'}):
+                if volume.attrs.get('Labels',{}).get('emerald.namespace')==self.namespace:
+                    try: volume.remove(force=True)
+                    except Exception: pass
+        except Exception:
             pass
