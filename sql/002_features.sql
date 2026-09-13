@@ -6,6 +6,8 @@ ALTER TABLE bots ADD COLUMN IF NOT EXISTS auto_update boolean NOT NULL DEFAULT f
 ALTER TABLE bots ADD COLUMN IF NOT EXISTS github_last_sha text;
 ALTER TABLE bots ADD COLUMN IF NOT EXISTS github_last_attempt_sha text;
 ALTER TABLE bots ADD COLUMN IF NOT EXISTS github_last_check timestamptz;
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS template_id text;
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS template_configured boolean NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS github_token text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS github_login text;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS github_user_id bigint;
@@ -37,3 +39,32 @@ CREATE TABLE IF NOT EXISTS sqlite_requests(
 CREATE INDEX IF NOT EXISTS sqlite_requests_queue ON sqlite_requests(state,created_at) WHERE state='pending';
 CREATE INDEX IF NOT EXISTS sqlite_requests_owner ON sqlite_requests(user_id,created_at DESC);
 ALTER TABLE worker_health ADD COLUMN IF NOT EXISTS supports_docker boolean NOT NULL DEFAULT false;
+ALTER TABLE worker_health ADD COLUMN IF NOT EXISTS supports_terminal boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS terminal_sessions(
+ id uuid PRIMARY KEY,
+ bot_id uuid NOT NULL REFERENCES bots(id) ON DELETE CASCADE,
+ state text NOT NULL DEFAULT 'opening' CHECK(state IN ('opening','open','closing','closed','error')),
+ setup_mode boolean NOT NULL DEFAULT false,
+ error_message text,
+ created_at timestamptz NOT NULL DEFAULT now(),
+ updated_at timestamptz NOT NULL DEFAULT now(),
+ last_activity_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS terminal_sessions_one_live ON terminal_sessions(bot_id) WHERE state IN ('opening','open','closing');
+CREATE INDEX IF NOT EXISTS terminal_sessions_bot ON terminal_sessions(bot_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS terminal_inputs(
+ id bigserial PRIMARY KEY,
+ session_id uuid NOT NULL REFERENCES terminal_sessions(id) ON DELETE CASCADE,
+ data text NOT NULL,
+ is_secret boolean NOT NULL DEFAULT false,
+ state text NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','active','done')),
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS terminal_inputs_queue ON terminal_inputs(state,id) WHERE state='pending';
+CREATE TABLE IF NOT EXISTS terminal_outputs(
+ id bigserial PRIMARY KEY,
+ session_id uuid NOT NULL REFERENCES terminal_sessions(id) ON DELETE CASCADE,
+ data text NOT NULL,
+ created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS terminal_outputs_session ON terminal_outputs(session_id,id);
