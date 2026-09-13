@@ -5,7 +5,7 @@ import sys
 
 import telebot
 
-from first_setup import create_config_obj, default_config
+from first_setup import create_config_obj, create_configs, default_config
 from Utils.cardinal_tools import build_proxy, check_proxy, hash_password, validate_proxy
 
 MARKER = 'EMERALD_TEMPLATE_SETUP_OK'
@@ -43,12 +43,13 @@ def main():
         return 2
 
     config = create_config_obj(default_config)
+    create_configs()
     print('\n=== FunPay Cardinal · первичная настройка Emerald Host ===')
     print('BOT_TOKEN уже передан платформой и повторно вводить его не нужно.\n')
 
     while True:
         golden_key = secret('golden_key FunPay (32 символа): ')
-        if len(golden_key) == 32 and golden_key == golden_key.lower() and ' ' not in golden_key:
+        if len(golden_key) == 32:
             config.set('FunPay', 'golden_key', golden_key)
             break
         print('Неверный формат golden_key. Попробуйте ещё раз.')
