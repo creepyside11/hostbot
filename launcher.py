@@ -1,4 +1,4 @@
-"""Start the stable Emerald worker plus GitHub and SQLite companions."""
+"""Start the stable Emerald worker plus SQLite companion."""
 import os
 import runpy
 import threading
@@ -7,7 +7,6 @@ import time
 import psycopg
 import private_repo_patch  # noqa: F401 - applies Runner patch on import
 from db_connection import connection_string, connect, operational_error_summary, validate_worker_database_url
-from github_watch import watch_forever as github_watch_forever
 from sqlite_inspector import watch_forever as sqlite_watch_forever
 
 
@@ -15,7 +14,6 @@ def wait_for_database():
     """Avoid a platform restart loop while PostgreSQL is temporarily unavailable."""
     try:
         validate_worker_database_url()
-        # Normalize Neon connections before the legacy modules read DATABASE_URL.
         os.environ['DATABASE_URL'] = connection_string()
     except Exception as error:
         print(str(error) if isinstance(error, RuntimeError) else 'DATABASE_URL исполнителя имеет некорректный формат.', flush=True)
@@ -43,6 +41,5 @@ def wait_for_database():
 
 
 wait_for_database()
-threading.Thread(target=github_watch_forever, name='github-auto-update', daemon=True).start()
 threading.Thread(target=sqlite_watch_forever, name='sqlite-inspector', daemon=True).start()
 runpy.run_path('/opt/emerald/main.py', run_name='__main__')
