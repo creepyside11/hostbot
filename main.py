@@ -12,6 +12,8 @@ from pathlib import Path
 import psycopg
 from psycopg.rows import dict_row
 from runner import Runner, decrypt, redact
+from template_runner import prepare_template
+from terminal_bridge import TerminalBridge
 
 STOP = threading.Event()
 LOGS = queue.Queue(maxsize=2000)
@@ -111,12 +113,23 @@ def execute_job(job, runner):
             status = 'stopped'
             log(bot_id, 'Бот остановлен.')
         else:
-            secret = decrypt(bot['secrets'], os.environ['ENCRYPTION_KEY'])
-            resolved = runner.start(bot, secret, rebuild=action in ('deploy', 'update'))
-            if resolved:
+            if bot.get('template_id') and not bot.get('template_configured') and action in ('start','restart'):
+                runner.stop(bot_id)
+                log(bot_id, 'Сначала завершите первичную настройку шаблона в терминале.')
                 with connect() as conn:
-                    conn.execute('UPDATE bots SET entrypoint=%s WHERE id=%s', (resolved,bot_id))
-            status = 'running'
+                    conn.execute("UPDATE bots SET status='stopped',desired='stopped',updated_at=now() WHERE id=%s", (bot_id,))
+                    conn.execute("UPDATE jobs SET state='failed',finished_at=now() WHERE id=%s", (job['id'],))
+                return
+            secret = decrypt(bot['secrets'], os.environ['ENCRYPTION_KEY'])
+            if action == 'deploy' and bot.get('template_id') and bot.get('desired') == 'stopped' and not bot.get('template_configured'):
+                prepare_template(runner, bot, secret)
+                status = 'stopped'
+            else:
+                resolved = runner.start(bot, secret, rebuild=action in ('deploy', 'update'))
+                if resolved:
+                    with connect() as conn:
+                        conn.execute('UPDATE bots SET entrypoint=%s WHERE id=%s', (resolved,bot_id))
+                status = 'running'
         with connect() as conn:
             if action == 'update':
                 conn.execute("UPDATE bots SET status=%s,github_last_sha=COALESCE(github_last_attempt_sha,github_last_sha),github_last_attempt_sha=NULL,updated_at=now() WHERE id=%s", (status, bot_id))
@@ -151,12 +164,18 @@ def ensure_schema(conn):
 
 def recover(conn):
     conn.execute("UPDATE jobs SET state='pending' WHERE state='active'")
+    conn.execute("UPDATE terminal_sessions SET state='closed',updated_at=now(),error_message='Worker перезапущен. Откройте терминал снова.' WHERE state IN ('opening','open','closing')")
+    conn.execute("UPDATE terminal_inputs SET state='done' WHERE state IN ('pending','active')")
     conn.execute("UPDATE bots SET status='deploying',updated_at=now() WHERE desired='running'")
     conn.execute("UPDATE bots SET status='stopped',updated_at=now() WHERE desired='stopped'")
     conn.execute("""INSERT INTO jobs(bot_id,action)
         SELECT b.id,CASE WHEN b.desired='deleted' THEN 'delete' ELSE 'start' END FROM bots b
         WHERE b.desired IN ('running','deleted') AND NOT EXISTS
         (SELECT 1 FROM jobs j WHERE j.bot_id=b.id AND j.state IN ('pending','active'))""")
+    conn.execute("""INSERT INTO jobs(bot_id,action)
+        SELECT b.id,'deploy' FROM bots b
+        WHERE b.template_id IS NOT NULL AND b.template_configured=false AND b.desired='stopped'
+          AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.bot_id=b.id AND j.state IN ('pending','active'))""")
 
 
 def queue_github_webhook_update(conn):
@@ -220,6 +239,7 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: STOP.set())
     signal.signal(signal.SIGINT, lambda *_: STOP.set())
     runner = Runner(os.getenv('DATA_DIR', '/app/data/emerald'), log)
+    terminal = TerminalBridge(runner)
     guard = connect()
     guard.autocommit = True
     if not guard.execute('SELECT pg_try_advisory_lock(739022) AS locked').fetchone()['locked']:
@@ -237,10 +257,11 @@ def main():
         with guard.transaction():
             recover(guard)
         threading.Thread(target=telegram, daemon=True).start()
-        print('Emerald Host: исполнитель запущен, GitHub auto-update работает через webhook.', flush=True)
+        print('Emerald Host: исполнитель запущен, GitHub auto-update и Docker PTY активны.', flush=True)
         while not STOP.is_set():
-            guard.execute("INSERT INTO worker_health(id,heartbeat,version,supports_docker) VALUES('nl',now(),'1.2.0',%s) ON CONFLICT(id) DO UPDATE SET heartbeat=now(),version='1.2.0',supports_docker=EXCLUDED.supports_docker", (runner.docker is not None,))
+            guard.execute("INSERT INTO worker_health(id,heartbeat,version,supports_docker,supports_terminal) VALUES('nl',now(),'1.3.0',%s,%s) ON CONFLICT(id) DO UPDATE SET heartbeat=now(),version='1.3.0',supports_docker=EXCLUDED.supports_docker,supports_terminal=EXCLUDED.supports_terminal", (runner.docker is not None, runner.docker is not None))
             flush_logs()
+            terminal.tick(guard)
             for bot_id, code in runner.exited(exclude=active_bot_id if future and not future.done() else None):
                 log(bot_id, f'Процесс завершился (код {code}). Для повторного запуска используйте панель.')
                 guard.execute("UPDATE bots SET status='error',updated_at=now() WHERE id=%s", (bot_id,))
@@ -256,6 +277,7 @@ def main():
                 future = executor.submit(execute_job, job, runner) if job else None
             if tick % 30 == 0:
                 check_storage(runner)
+                terminal.cleanup(guard)
                 guard.execute('DELETE FROM sessions WHERE expires_at<now()')
                 guard.execute('DELETE FROM rate_limits WHERE expires_at<now()')
                 guard.execute("DELETE FROM jobs WHERE state IN ('done','failed') AND finished_at<now()-interval '7 days'")
@@ -263,6 +285,7 @@ def main():
             STOP.wait(2)
     finally:
         STOP.set()
+        terminal.shutdown()
         runner.shutdown()
         executor.shutdown(wait=True, cancel_futures=True)
         try:
