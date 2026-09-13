@@ -14,4 +14,3 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m py_compile main.py runner.py docker_backend.py terminal_bridge.py template_runner.py template_setup_funpay.py github_worker.py github_watch.py private_repo_patch.py sqlite_inspector.py db_connection.py launcher.py
-      - run: grep -q "sidor0912/FunPayCardinal" ../hostsait-does-not-exist 2>/dev/null || true
