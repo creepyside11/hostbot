@@ -4,6 +4,7 @@ import os
 import sqlite3
 import time
 import urllib.parse
+from contextlib import closing
 from pathlib import Path
 
 import psycopg
@@ -101,7 +102,7 @@ def scalar(value):
 
 
 def database_tables(path):
-    with open_readonly(path) as conn:
+    with closing(open_readonly(path)) as conn:
         rows = conn.execute("""SELECT type,name,tbl_name,sql FROM sqlite_master
             WHERE type IN ('table','view') ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END,name COLLATE NOCASE""").fetchall()
         return {'tables': [{'type': row['type'], 'name': row['name'], 'table': row['tbl_name'],
@@ -109,7 +110,7 @@ def database_tables(path):
 
 
 def database_schema(path):
-    with open_readonly(path) as conn:
+    with closing(open_readonly(path)) as conn:
         rows = conn.execute("""SELECT type,name,tbl_name,sql FROM sqlite_master
             ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'view' THEN 1 WHEN 'index' THEN 2 ELSE 3 END,name COLLATE NOCASE""").fetchall()
         return {'schema': [{'type': row['type'], 'name': row['name'], 'table': row['tbl_name'], 'sql': row['sql']} for row in rows]}
@@ -119,7 +120,7 @@ def database_rows(path, table, offset, limit):
     offset = max(0, min(int(offset or 0), 10_000_000))
     limit = max(1, min(int(limit or 100), 250))
     quoted = qident(table)
-    with open_readonly(path) as conn:
+    with closing(open_readonly(path)) as conn:
         exists = conn.execute("SELECT type FROM sqlite_master WHERE name=? AND type IN ('table','view')", (table,)).fetchone()
         if not exists:
             raise ValueError('Таблица или view не найдены.')
