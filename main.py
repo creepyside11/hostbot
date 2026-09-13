@@ -129,6 +129,19 @@ def execute_job(job, runner):
             conn.execute("UPDATE jobs SET state='failed',finished_at=now() WHERE id=%s", (job['id'],))
 
 
+def ensure_schema(conn):
+    """Bootstrap an empty database without deleting existing tables or records."""
+    migration = Path(__file__).resolve().parent / 'sql' / '001_init.sql'
+    if not migration.is_file():
+        raise RuntimeError('В образе отсутствует sql/001_init.sql. Пересоберите контейнер из main.')
+    sql = migration.read_text(encoding='utf-8').strip()
+    # The standalone SQL file has its own transaction wrapper; psycopg owns it here.
+    sql = sql.removeprefix('BEGIN;').removesuffix('COMMIT;')
+    with conn.transaction():
+        conn.execute(sql, prepare=False)
+    print('PostgreSQL: таблицы Emerald Host готовы.', flush=True)
+
+
 def recover(conn):
     # A container restart kills its child processes. Re-run interrupted commands, then restore desired bots.
     conn.execute("UPDATE jobs SET state='pending' WHERE state='active'")
@@ -191,6 +204,7 @@ def main():
     active_bot_id = None
     tick = 0
     try:
+        ensure_schema(guard)
         with guard.transaction():
             recover(guard)
         threading.Thread(target=telegram, daemon=True).start()
@@ -234,5 +248,12 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as error:
-        print(f'Исполнитель остановлен ({type(error).__name__}). Проверьте БД, миграцию и окружение.', flush=True)
+        if isinstance(error, psycopg.errors.InsufficientPrivilege):
+            print('Нет прав PostgreSQL: пользователю DATABASE_URL нужны CREATE в схеме и доступ к таблицам Emerald Host. Выдайте права или выполните sql/001_init.sql владельцем БД.', flush=True)
+        elif isinstance(error, psycopg.errors.UndefinedTable):
+            print('Не найдена таблица PostgreSQL. Проверьте, что сайт и исполнитель используют одну БД и схему; обновите контейнер из main.', flush=True)
+        elif isinstance(error, RuntimeError):
+            print(str(error), flush=True)
+        else:
+            print(f'Исполнитель остановлен ({type(error).__name__}). Проверьте БД и окружение.', flush=True)
         raise SystemExit(1)

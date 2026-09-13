@@ -4,6 +4,7 @@ WORKDIR /opt/emerald
 COPY requirements.txt .
 RUN python3 -m venv /opt/emerald/venv && /opt/emerald/venv/bin/pip install --no-cache-dir -r requirements.txt
 COPY main.py runner.py entrypoint.sh ./
+COPY sql/ ./sql/
 RUN useradd --create-home --uid 10001 emerald && mkdir -p /app/data/emerald && chown -R emerald:emerald /app/data/emerald /opt/emerald
 ENV DATA_DIR=/app/data/emerald PYTHONUNBUFFERED=1
 ENTRYPOINT ["/bin/sh", "/opt/emerald/entrypoint.sh"]
