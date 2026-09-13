@@ -64,6 +64,9 @@ def redact(text, secrets):
 
 
 def kill_group(process):
+    if hasattr(process, 'container'):
+        process.stop()
+        return
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -80,6 +83,20 @@ def kill_group(process):
     process.wait(timeout=5)
 
 
+def resolve_entrypoint(project, requested, runtime):
+    requested = requested or ('main.py' if runtime == 'python' else 'index.js')
+    candidates = [requested]
+    if runtime == 'python' and requested == 'main.py':
+        candidates.append('bot.py')
+    for candidate in candidates:
+        target = (project / candidate).resolve()
+        if not target.is_relative_to(project.resolve()):
+            raise ValueError('Файл запуска должен находиться внутри проекта.')
+        if target.is_file():
+            return candidate
+    raise ValueError('Файл запуска не найден: ' + ', '.join(candidates) + '. Измените его в настройках бота.')
+
+
 class Runner:
     def __init__(self, root, log):
         self.root = Path(root).resolve()
@@ -90,6 +107,14 @@ class Runner:
         self.lock = threading.RLock()
         self.closing = threading.Event()
         self.install_timeout = int(os.getenv('INSTALL_TIMEOUT', '600'))
+        self.docker = None
+        self.docker_bots = set()
+        if os.getenv('DOCKER_HOST'):
+            from docker_backend import DockerBackend
+            try:
+                self.docker = DockerBackend()
+            except Exception:
+                print('Docker-сборщик недоступен. Проверьте DOCKER_HOST и TLS. Системный режим доступен.', flush=True)
 
     def environment(self, home, secrets=None):
         # Do not inherit the manager's BOT_TOKEN, DATABASE_URL, or encryption key.
@@ -101,7 +126,7 @@ class Runner:
             env.update(secrets)
         return env
 
-    def reader(self, bot_id, process, secrets):
+    def reader(self, bot_id, process, secrets, stream="runtime"):
         window, count = time.monotonic(), 0
         try:
             while True:
@@ -117,9 +142,9 @@ class Runner:
                 if time.monotonic() - window >= 1:
                     count, window = 0, time.monotonic()
                 if count < 20 and text:
-                    self.log(bot_id, text[:4000])
+                    self.log(bot_id, text[:4000], stream)
                 elif count == 20:
-                    self.log(bot_id, '[Частые сообщения ограничены до 20 строк/сек]')
+                    self.log(bot_id, '[Частые сообщения ограничены до 20 строк/сек]', stream)
                 count += 1
         finally:
             process.stdout.close()
@@ -131,7 +156,7 @@ class Runner:
             process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
             (self.builds if build else self.processes)[bot_id] = process
-        thread = threading.Thread(target=self.reader, args=(bot_id, process, secrets), daemon=True)
+        thread = threading.Thread(target=self.reader, args=(bot_id, process, secrets, "build" if build else "runtime"), daemon=True)
         thread.start()
         return process, thread
 
@@ -157,7 +182,7 @@ class Runner:
         home.mkdir(exist_ok=True)
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir()
-        self.log(bot_id, 'Получение исходного кода…')
+        self.log(bot_id, 'Получение исходного кода…', 'build')
         try:
             if bot['source'] == 'github':
                 repo = bot['repo']
@@ -180,73 +205,108 @@ class Runner:
             else:
                 raw = bytes(bot['archive'])
             project = extract_zip(raw, staging)
-            target = (project / bot['entrypoint']).resolve()
-            if not target.is_relative_to(project.resolve()) or not target.is_file():
-                raise ValueError('Файл запуска не найден. Проверьте путь относительно корня проекта.')
+            custom = bot.get('build_mode') == 'dockerfile'
+            if custom:
+                if not self.docker:
+                    raise RuntimeError('Docker-сборщик не подключён. На Bothost используйте системное окружение либо подключите внешний Docker-сервер.')
+                target=(project / bot['dockerfile_path']).resolve()
+                if not target.is_relative_to(project.resolve()) or not target.is_file():
+                    raise ValueError('Dockerfile не найден по указанному пути.')
+            else:
+                resolved = resolve_entrypoint(project, bot['entrypoint'], bot['runtime'])
+                self.log(bot_id, 'Главный файл: ' + resolved, 'build')
             shutil.rmtree(source, ignore_errors=True)
             project.rename(source)
             if staging.exists():
                 shutil.rmtree(staging)
             env = self.environment(home)
-            if bot['runtime'] == 'python':
+            if custom:
+                self.log(bot_id, 'Сборка из ' + bot['dockerfile_path'], 'build')
+                self.docker.build(bot_id,source,bot['dockerfile_path'],
+                                  lambda line:self.log(bot_id,redact(line,secrets),'build'),self.install_timeout,self.closing)
+            elif bot['runtime'] == 'python':
                 venv = home / '.venv'
                 shutil.rmtree(venv, ignore_errors=True)
-                self.log(bot_id, 'Создание отдельного Python-окружения…')
+                self.log(bot_id, 'Создание отдельного Python-окружения…', 'build')
                 self.install_command(bot_id, [sys.executable, '-m', 'venv', str(venv)], source, env, secrets)
                 python = str(venv / 'bin/python')
                 requirements = source / 'requirements.txt'
                 if requirements.is_file():
-                    self.log(bot_id, 'Установка зависимостей из requirements.txt…')
+                    self.log(bot_id, 'Установка зависимостей из requirements.txt…', 'build')
                     self.install_command(bot_id, [python, '-m', 'pip', 'install', '--no-cache-dir', '-r', 'requirements.txt'], source, env, secrets)
                 else:
-                    self.log(bot_id, 'requirements.txt отсутствует — установка пропущена.')
+                    self.log(bot_id, 'requirements.txt отсутствует — установка пропущена.', 'build')
             elif bot['runtime'] == 'node':
                 if not shutil.which('node') or not shutil.which('npm'):
                     raise RuntimeError('В окружении исполнителя нет Node.js/npm. Используйте Dockerfile проекта.')
                 if (source / 'package.json').is_file():
-                    self.log(bot_id, 'Установка зависимостей из package.json…')
+                    self.log(bot_id, 'Установка зависимостей из package.json…', 'build')
                     command = ['npm', 'ci' if (source / 'package-lock.json').is_file() else 'install', '--omit=dev', '--no-audit', '--no-fund']
                     self.install_command(bot_id, command, source, env, secrets)
             (home / 'ready').write_text('1')
-            self.log(bot_id, 'Код и зависимости готовы.')
+            self.log(bot_id, 'Код и зависимости готовы.', 'build')
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
     def start(self, bot, secrets, rebuild=False):
         bot_id = str(bot['id'])
+        if bot.get('build_mode')=='dockerfile': self.docker_bots.add(bot_id)
         self.stop(bot_id)
         home = self.root / bot_id
         if rebuild or not (home / 'ready').is_file():
             (home / 'ready').unlink(missing_ok=True)
-            self.prepare(bot, secrets)
+            try:
+                self.prepare(bot, secrets)
+            except Exception as error:
+                error.log_stream='build'
+                raise
         with self.lock:
             if len(self.processes) >= int(os.getenv('MAX_RUNNING_BOTS', '10')):
                 raise RuntimeError('Достигнут лимит одновременно запущенных ботов.')
         source = home / 'source'
         env = self.environment(home, secrets)
-        if bot['runtime'] == 'python':
+        custom = bot.get('build_mode') == 'dockerfile'
+        resolved = None if custom else resolve_entrypoint(source, bot['entrypoint'], bot['runtime'])
+        if custom:
+            if not self.docker:
+                raise RuntimeError('Docker-сборщик недоступен.')
+            with self.lock:
+                if self.closing.is_set(): raise RuntimeError('Исполнитель завершается.')
+                process=self.docker.start(bot_id, secrets)
+                self.processes[bot_id]=process
+            threading.Thread(target=self.reader,args=(bot_id,process,secrets),daemon=True).start()
+        elif bot['runtime'] == 'python':
             env['VIRTUAL_ENV'] = str(home / '.venv')
             env['PATH'] = str(home / '.venv/bin') + ':' + env['PATH']
-            command = [str(home / '.venv/bin/python'), '-u', bot['entrypoint']]
+            command = [str(home / '.venv/bin/python'), '-u', resolved]
         else:
-            command = ['node', bot['entrypoint']]
+            command = ['node', resolved]
         self.log(bot_id, 'Запуск процесса…')
-        process, _ = self.spawn(bot_id, command, source, env, secrets)
+        if not custom:
+            process, _ = self.spawn(bot_id, command, source, env, secrets)
         if self.closing.wait(3):
             raise RuntimeError('Исполнитель завершается.')
         if process.poll() is not None:
             self.stop(bot_id)
             raise RuntimeError('Бот завершился сразу после запуска. Подробности выше в логах.')
         self.log(bot_id, 'Процесс работает. Telegram-подключение проверяйте по логам самого бота.')
+        return resolved
 
     def stop(self, bot_id):
         with self.lock:
             process = self.processes.pop(bot_id, None)
         if process:
             kill_group(process)
+        elif bot_id in self.docker_bots:
+            if not self.docker: raise RuntimeError('Docker-сервер недоступен: невозможно подтвердить остановку контейнера.')
+            self.docker.stop_existing(bot_id)
 
     def delete(self, bot_id):
         self.stop(bot_id)
+        if bot_id in self.docker_bots:
+            if not self.docker: raise RuntimeError('Docker-сервер недоступен. Удаление контейнера не подтверждено.')
+            self.docker.delete(bot_id)
+            self.docker_bots.discard(bot_id)
         shutil.rmtree(self.root / bot_id, ignore_errors=True)
 
     def exited(self, exclude=None):
@@ -266,4 +326,7 @@ class Runner:
             self.processes.clear()
             self.builds.clear()
         for process in processes:
-            kill_group(process)
+            try:
+                kill_group(process)
+            except Exception:
+                print('Не удалось подтвердить остановку процесса/контейнера. Проверьте исполнитель и Docker-сервер.', flush=True)

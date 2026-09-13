@@ -10,7 +10,7 @@ import tempfile
 import unittest
 import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from runner import Runner, extract_zip, redact, decrypt
+from runner import Runner, extract_zip, redact, decrypt, resolve_entrypoint
 
 
 def archive(files):
@@ -22,6 +22,31 @@ def archive(files):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_main_file_fallback_and_explicit_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'bot.py').write_text('pass')
+            self.assertEqual(resolve_entrypoint(root,'main.py','python'),'bot.py')
+            (root/'main.py').write_text('pass')
+            self.assertEqual(resolve_entrypoint(root,'main.py','python'),'main.py')
+            self.assertEqual(resolve_entrypoint(root,'bot.py','python'),'bot.py')
+            with self.assertRaises(ValueError):resolve_entrypoint(root,'other.py','python')
+            with self.assertRaises(ValueError):resolve_entrypoint(root,'../escape.py','python')
+            with self.assertRaises(ValueError):resolve_entrypoint(root,'index.js','node')
+
+    def test_dockerfile_rejected_without_daemon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner=Runner(tmp,lambda *_:None)
+            runner.docker=None
+            bot={'id':'33333333-3333-3333-3333-333333333333','source':'zip','runtime':'python','entrypoint':'main.py',
+                 'build_mode':'dockerfile','dockerfile_path':'Dockerfile',
+                 'archive':archive({'Dockerfile':'FROM python:3.11-slim\nCMD ["python", "bot.py"]','bot.py':'print(1)'})}
+            try:
+                with self.assertRaisesRegex(RuntimeError,'Docker-'):
+                    runner.start(bot,{})
+                self.assertFalse(runner.processes)
+            finally:runner.shutdown()
+
     def test_reject_traversal_symlink_and_large_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
             for name in ['../escape.py', '/absolute.py', 'x/../../escape.py', 'x\\escape.py']:
@@ -64,7 +89,7 @@ class RunnerTests(unittest.TestCase):
         # Offline real pip installation into the bot virtualenv, followed by a long-lived process.
         with tempfile.TemporaryDirectory() as tmp:
             events=[]
-            r=Runner(tmp,lambda _,msg:events.append(msg))
+            r=Runner(tmp,lambda _,msg,stream="runtime":events.append((stream,msg)))
             wheel=archive({'emerald_sample.py':'VALUE="installed"',
                 'emerald_sample-1.0.dist-info/METADATA':'Metadata-Version: 2.1\nName: emerald-sample\nVersion: 1.0\n',
                 'emerald_sample-1.0.dist-info/WHEEL':'Wheel-Version: 1.0\nGenerator: emerald-tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
@@ -77,8 +102,8 @@ class RunnerTests(unittest.TestCase):
                 r.start(bot,{'BOT_TOKEN':'child-secret'})
                 first=r.processes[bot['id']]
                 self.assertIsNone(first.poll())
-                self.assertTrue(any('requirements.txt' in x for x in events))
-                self.assertTrue(any('installed [СКРЫТО]' in x for x in events))
+                self.assertTrue(any(stream=='build' and 'requirements.txt' in x for stream,x in events))
+                self.assertTrue(any(stream=='runtime' and 'installed [СКРЫТО]' in x for stream,x in events))
                 r.stop(bot['id']);self.assertIsNotNone(first.poll())
                 r.start(bot,{'BOT_TOKEN':'child-secret'})
                 self.assertNotEqual(first.pid,r.processes[bot['id']].pid)

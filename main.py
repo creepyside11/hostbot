@@ -22,9 +22,9 @@ def connect():
                           options='-c statement_timeout=15000')
 
 
-def log(bot_id, message):
+def log(bot_id, message, stream="runtime"):
     try:
-        LOGS.put_nowait((bot_id, message[:4000]))
+        LOGS.put_nowait((bot_id, message[:4000], stream))
     except queue.Full:
         pass
 
@@ -40,10 +40,10 @@ def flush_logs():
         with connect() as conn:
             # Delete may have removed the bot before a reader finished draining stdout.
             with conn.cursor() as cur:
-                cur.executemany('INSERT INTO logs(bot_id,message) SELECT id,%s FROM bots WHERE id=%s',
-                                [(message, bot_id) for bot_id, message in batch])
-            for bot_id in {item[0] for item in batch}:
-                conn.execute('DELETE FROM logs WHERE bot_id=%s AND id NOT IN (SELECT id FROM logs WHERE bot_id=%s ORDER BY id DESC LIMIT 1000)', (bot_id, bot_id))
+                cur.executemany('INSERT INTO logs(bot_id,message,stream) SELECT id,%s,%s FROM bots WHERE id=%s',
+                                [(message, stream, bot_id) for bot_id, message, stream in batch])
+            for bot_id, stream in {(item[0],item[2]) for item in batch}:
+                conn.execute('DELETE FROM logs WHERE bot_id=%s AND stream=%s AND id NOT IN (SELECT id FROM logs WHERE bot_id=%s AND stream=%s ORDER BY id DESC LIMIT 1000)', (bot_id, stream, bot_id, stream))
 
 
 def telegram():
@@ -100,9 +100,10 @@ def execute_job(job, runner):
             bot = conn.execute('SELECT * FROM bots WHERE id=%s', (bot_id,)).fetchone()
         if not bot:
             return
+        if bot.get('build_mode')=='dockerfile': runner.docker_bots.add(bot_id)
         action = job['action']
         log(bot_id, {'deploy':'Деплой', 'start':'Запуск', 'restart':'Перезапуск', 'update':'Обновление из GitHub',
-                     'stop':'Остановка', 'delete':'Удаление'}[action] + ': задание получено.')
+                     'stop':'Остановка', 'delete':'Удаление'}[action] + ': задание получено.', 'build' if action in ('deploy','update') else 'runtime')
         if action == 'delete':
             runner.delete(bot_id)
             with connect() as conn:
@@ -114,16 +115,22 @@ def execute_job(job, runner):
             log(bot_id, 'Бот остановлен.')
         else:
             secret = decrypt(bot['secrets'], os.environ['ENCRYPTION_KEY'])
-            runner.start(bot, secret, rebuild=action in ('deploy', 'update'))
+            resolved = runner.start(bot, secret, rebuild=action in ('deploy', 'update'))
+            if resolved:
+                with connect() as conn:
+                    conn.execute('UPDATE bots SET entrypoint=%s WHERE id=%s', (resolved,bot_id))
             status = 'running'
         with connect() as conn:
             conn.execute('UPDATE bots SET status=%s,updated_at=now() WHERE id=%s', (status, bot_id))
             conn.execute("UPDATE jobs SET state='done',finished_at=now() WHERE id=%s", (job['id'],))
     except Exception as error:
-        runner.stop(bot_id)
+        try:
+            runner.stop(bot_id)
+        except Exception:
+            log(bot_id,'Не удалось подтвердить остановку контейнера. Проверьте Docker-сервер.')
         # Curated validation/runtime errors are actionable; library errors may contain credentials.
         message = str(error) if type(error) in (ValueError, RuntimeError) else f'Ошибка выполнения ({type(error).__name__}). Проверьте исходники, доступность сети и настройки.'
-        log(bot_id, redact(message, secret))
+        log(bot_id, redact(message, secret), getattr(error,'log_stream','runtime'))
         with connect() as conn:
             conn.execute("UPDATE bots SET status='error',updated_at=now() WHERE id=%s", (bot_id,))
             conn.execute("UPDATE jobs SET state='failed',finished_at=now() WHERE id=%s", (job['id'],))
@@ -138,7 +145,9 @@ def ensure_schema(conn):
     # The standalone SQL file has its own transaction wrapper; psycopg owns it here.
     sql = sql.removeprefix('BEGIN;').removesuffix('COMMIT;')
     with conn.transaction():
+        conn.execute('SELECT pg_advisory_xact_lock(739023)')
         conn.execute(sql, prepare=False)
+        conn.execute((migration.parent / '002_features.sql').read_text(encoding='utf-8'), prepare=False)
     print('PostgreSQL: таблицы Emerald Host готовы.', flush=True)
 
 
@@ -205,13 +214,16 @@ def main():
     tick = 0
     try:
         ensure_schema(guard)
+        if runner.docker:
+            for row in guard.execute("SELECT id FROM bots WHERE build_mode='dockerfile'").fetchall():
+                runner.docker.stop_existing(str(row['id']))
         with guard.transaction():
             recover(guard)
         threading.Thread(target=telegram, daemon=True).start()
         print('Emerald Host: исполнитель запущен, ожидаю задания.', flush=True)
         while not STOP.is_set():
             # Loss of the lock-owning connection terminates all children to avoid duplicate polling.
-            guard.execute("INSERT INTO worker_health(id,heartbeat,version) VALUES('nl',now(),'1.0.0') ON CONFLICT(id) DO UPDATE SET heartbeat=now(),version='1.0.0'")
+            guard.execute("INSERT INTO worker_health(id,heartbeat,version,supports_docker) VALUES('nl',now(),'1.1.0',%s) ON CONFLICT(id) DO UPDATE SET heartbeat=now(),version='1.1.0',supports_docker=EXCLUDED.supports_docker", (runner.docker is not None,))
             flush_logs()
             for bot_id, code in runner.exited(exclude=active_bot_id if future and not future.done() else None):
                 log(bot_id, f'Процесс завершился (код {code}). Для повторного запуска используйте панель.')
