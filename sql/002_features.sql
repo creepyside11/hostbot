@@ -2,4 +2,13 @@ ALTER TABLE logs ADD COLUMN IF NOT EXISTS stream text NOT NULL DEFAULT 'runtime'
 CREATE INDEX IF NOT EXISTS logs_stream_id ON logs(bot_id,stream,id DESC);
 ALTER TABLE bots ADD COLUMN IF NOT EXISTS build_mode text NOT NULL DEFAULT 'system' CHECK(build_mode IN ('system','dockerfile'));
 ALTER TABLE bots ADD COLUMN IF NOT EXISTS dockerfile_path text NOT NULL DEFAULT 'Dockerfile';
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS auto_update boolean NOT NULL DEFAULT false;
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS github_last_sha text;
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS github_last_attempt_sha text;
+ALTER TABLE bots ADD COLUMN IF NOT EXISTS github_last_check timestamptz;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS github_token text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS github_login text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS github_user_id bigint;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS github_scope text;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS github_connected_at timestamptz;
 ALTER TABLE worker_health ADD COLUMN IF NOT EXISTS supports_docker boolean NOT NULL DEFAULT false;
