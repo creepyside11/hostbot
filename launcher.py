@@ -1,4 +1,4 @@
-"""Start the stable Emerald worker plus SQLite companion."""
+"""Start the stable Emerald worker plus dashboard companion services."""
 import os
 import runpy
 import threading
@@ -7,6 +7,7 @@ import time
 import psycopg
 import private_repo_patch  # noqa: F401 - applies Runner patch on import
 from db_connection import connection_string, connect, operational_error_summary, validate_worker_database_url
+from file_manager import watch_forever as file_manager_watch_forever
 from sqlite_inspector import watch_forever as sqlite_watch_forever
 
 
@@ -42,4 +43,5 @@ def wait_for_database():
 
 wait_for_database()
 threading.Thread(target=sqlite_watch_forever, name='sqlite-inspector', daemon=True).start()
+threading.Thread(target=file_manager_watch_forever, name='file-manager', daemon=True).start()
 runpy.run_path('/opt/emerald/main.py', run_name='__main__')
