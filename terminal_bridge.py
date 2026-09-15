@@ -218,12 +218,14 @@ class TerminalBridge:
     def tick(self, conn):
         # Advertise PTY capability independently from Docker support.
         conn.execute("UPDATE worker_health SET supports_terminal=%s WHERE id='nl'", (self.available,))
-        # Open at most two new sessions per tick.
-        rows = conn.execute("""SELECT s.id,s.bot_id,s.setup_mode,b.id,b.build_mode,b.runtime,b.status,b.secrets
+        # Open at most two new sessions per tick. Keep the session id distinct from the bot id:
+        # psycopg dict_row keeps one value for duplicate column names, so an unaliased b.id used
+        # to overwrite s.id and left the real terminal session stuck in `opening` forever.
+        rows = conn.execute("""SELECT s.id AS session_id,s.bot_id,s.setup_mode,b.id,b.build_mode,b.runtime,b.status,b.secrets
             FROM terminal_sessions s JOIN bots b ON b.id=s.bot_id
             WHERE s.state='opening' ORDER BY s.created_at LIMIT 2""").fetchall()
         for row in rows:
-            sid, bot_id = str(row['id']), str(row['bot_id'])
+            sid, bot_id = str(row['session_id']), str(row['bot_id'])
             try:
                 if row['status'] not in ('running', 'stopped'):
                     raise RuntimeError('Дождитесь завершения текущей операции с ботом.')

@@ -81,6 +81,12 @@ class TerminalBridgeTests(unittest.TestCase):
             finally:
                 bridge.shutdown()
 
+    def test_opening_session_query_keeps_terminal_session_id_separate_from_bot_id(self):
+        source = (Path(__file__).resolve().parents[1] / 'terminal_bridge.py').read_text(encoding='utf-8')
+        self.assertIn('s.id AS session_id', source)
+        self.assertIn("str(row['session_id'])", source)
+        self.assertNotIn('SELECT s.id,s.bot_id,s.setup_mode,b.id', source)
+
 
 if __name__ == '__main__':
     unittest.main()
