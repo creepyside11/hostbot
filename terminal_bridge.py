@@ -1,11 +1,95 @@
-"""Database-backed PTY bridge for isolated Docker bot containers."""
+"""Database-backed PTY bridge for Docker and system-mode bot projects."""
+import os
+import pty
 import queue
 import re
+import shutil
+import signal
+import subprocess
 import threading
 import time
 
+from runner import decrypt
+
 ANSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 SETUP_MARKER = 'EMERALD_TEMPLATE_SETUP_OK'
+
+
+class LocalPty:
+    """Interactive shell attached only to one bot's project directory/environment."""
+    def __init__(self, runner, bot, secrets):
+        bot_id = str(bot['id'])
+        home = runner.root / bot_id
+        source = home / 'source'
+        if not (home / 'ready').is_file() or not source.is_dir():
+            raise RuntimeError('Проект ещё не подготовлен. Сначала завершите деплой бота.')
+        env = runner.environment(home, secrets)
+        if bot.get('runtime') == 'python':
+            venv = home / '.venv'
+            python = venv / 'bin' / 'python'
+            if not python.is_file():
+                raise RuntimeError('Python-окружение проекта не найдено. Выполните обновление бота.')
+            env['VIRTUAL_ENV'] = str(venv)
+            env['PATH'] = str(venv / 'bin') + ':' + env['PATH']
+        env['TERM'] = 'xterm-256color'
+        env['COLORTERM'] = 'truecolor'
+        shell = shutil.which('bash', path=env['PATH']) or '/bin/sh'
+        env['SHELL'] = shell
+        env['PS1'] = 'emerald:\\w$ ' if shell.endswith('bash') else 'emerald$ '
+        command = [shell, '--noprofile', '--norc'] if shell.endswith('bash') else [shell]
+        master, slave = pty.openpty()
+        try:
+            self.process = subprocess.Popen(
+                command, cwd=source, env=env, stdin=slave, stdout=slave, stderr=slave,
+                close_fds=True, start_new_session=True,
+            )
+        except Exception:
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
+        self.fd = master
+        self.lock = threading.Lock()
+
+    def recv(self, size):
+        fd = self.fd
+        if fd is None:
+            return b''
+        return os.read(fd, size)
+
+    def sendall(self, data):
+        view = memoryview(data)
+        with self.lock:
+            fd = self.fd
+            if fd is None:
+                raise RuntimeError('PTY закрыт.')
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+
+    def close(self):
+        with self.lock:
+            fd, self.fd = self.fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        process = getattr(self, 'process', None)
+        if not process or process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=1)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 class TerminalBridge:
@@ -15,6 +99,7 @@ class TerminalBridge:
         self.outputs = queue.Queue(maxsize=4000)
         self.lock = threading.RLock()
         self.stopping = threading.Event()
+        self.available = os.name == 'posix'
 
     def _socket_io(self, output):
         raw = getattr(output, '_sock', output)
@@ -39,12 +124,14 @@ class TerminalBridge:
             if hasattr(output, 'flush'):
                 output.flush()
             return
-        raise RuntimeError('Docker PTY не поддерживает stdin.')
+        raise RuntimeError('PTY не поддерживает stdin.')
 
     def _close_socket(self, session):
+        seen = set()
         for obj in (session.get('raw'), session.get('output')):
             try:
-                if obj and hasattr(obj, 'close'):
+                if obj and id(obj) not in seen and hasattr(obj, 'close'):
+                    seen.add(id(obj))
                     obj.close()
             except Exception:
                 pass
@@ -60,7 +147,10 @@ class TerminalBridge:
             except Exception:
                 data = b''
             if not data:
-                self.outputs.put((session_id, session['bot_id'], '\n[Emerald] PTY закрыт.\n', False, True))
+                try:
+                    self.outputs.put_nowait((session_id, session['bot_id'], '\n[Emerald] PTY закрыт.\n', False, True))
+                except queue.Full:
+                    pass
                 return
             text = ANSI.sub('', data.decode('utf-8', errors='replace')).replace('\x00', '')
             configured = SETUP_MARKER in text
@@ -74,12 +164,27 @@ class TerminalBridge:
                 except queue.Full:
                     pass
 
-    def open(self, session_id, bot_id, setup_mode):
-        if not self.runner.docker:
-            raise RuntimeError('Docker-терминал недоступен.')
-        result = self.runner.docker.open_terminal(bot_id)
+    def open(self, session_id, bot, setup_mode, secrets):
+        bot_id = str(bot['id'])
+        custom = bot.get('build_mode') == 'dockerfile'
+        if custom:
+            if not self.runner.docker:
+                raise RuntimeError('Docker-терминал недоступен.')
+            result = self.runner.docker.open_terminal(bot_id)
+            backend = 'container'
+        else:
+            if not self.available:
+                raise RuntimeError('System PTY недоступен на этом исполнителе.')
+            if setup_mode:
+                raise RuntimeError('Первичная настройка шаблона требует Docker-окружение.')
+            result = LocalPty(self.runner, bot, secrets)
+            backend = 'system'
         output, raw = self._socket_io(result)
-        session = {'bot_id': bot_id, 'output': output, 'raw': raw, 'setup_mode': setup_mode, 'secrets': []}
+        initial_secrets = [str(value) for value in secrets.values() if value]
+        session = {
+            'bot_id': bot_id, 'output': output, 'raw': raw, 'setup_mode': setup_mode,
+            'secrets': initial_secrets[-64:], 'backend': backend,
+        }
         with self.lock:
             old = self.sessions.pop(session_id, None)
             if old:
@@ -89,6 +194,7 @@ class TerminalBridge:
         if setup_mode:
             time.sleep(0.15)
             self.send(session_id, 'python /app/emerald_setup.py\n', secret=False)
+        return backend
 
     def send(self, session_id, data, secret=False):
         with self.lock:
@@ -100,7 +206,7 @@ class TerminalBridge:
             clean = value.rstrip('\r\n')
             if clean:
                 session['secrets'].append(clean)
-                session['secrets'][:] = session['secrets'][-20:]
+                session['secrets'][:] = session['secrets'][-64:]
         self._send(session['output'], session['raw'], value.encode('utf-8'))
 
     def close(self, session_id):
@@ -110,18 +216,22 @@ class TerminalBridge:
             self._close_socket(session)
 
     def tick(self, conn):
+        # Advertise PTY capability independently from Docker support.
+        conn.execute("UPDATE worker_health SET supports_terminal=%s WHERE id='nl'", (self.available,))
         # Open at most two new sessions per tick.
-        rows = conn.execute("""SELECT s.id,s.bot_id,s.setup_mode,b.build_mode,b.status
+        rows = conn.execute("""SELECT s.id,s.bot_id,s.setup_mode,b.id,b.build_mode,b.runtime,b.status,b.secrets
             FROM terminal_sessions s JOIN bots b ON b.id=s.bot_id
             WHERE s.state='opening' ORDER BY s.created_at LIMIT 2""").fetchall()
         for row in rows:
             sid, bot_id = str(row['id']), str(row['bot_id'])
             try:
-                if row['build_mode'] != 'dockerfile':
-                    raise RuntimeError('Терминал доступен только Docker-ботам.')
-                self.open(sid, bot_id, bool(row['setup_mode']))
+                if row['status'] not in ('running', 'stopped'):
+                    raise RuntimeError('Дождитесь завершения текущей операции с ботом.')
+                secrets = decrypt(row['secrets'], os.environ['ENCRYPTION_KEY'])
+                backend = self.open(sid, row, bool(row['setup_mode']), secrets)
                 conn.execute("UPDATE terminal_sessions SET state='open',error_message=NULL,updated_at=now(),last_activity_at=now() WHERE id=%s", (sid,))
-                conn.execute("INSERT INTO terminal_outputs(session_id,data) VALUES(%s,%s)", (sid, '[Emerald] PTY контейнера подключён.\n'))
+                label = 'контейнера' if backend == 'container' else 'окружения проекта'
+                conn.execute("INSERT INTO terminal_outputs(session_id,data) VALUES(%s,%s)", (sid, f'[Emerald] PTY {label} подключён.\n'))
             except Exception as error:
                 conn.execute("UPDATE terminal_sessions SET state='error',error_message=%s,updated_at=now() WHERE id=%s", (str(error)[:500], sid))
 
@@ -166,6 +276,9 @@ class TerminalBridge:
     def cleanup(self, conn):
         conn.execute("DELETE FROM terminal_inputs WHERE state='done' AND created_at<now()-interval '10 minutes'")
         conn.execute("DELETE FROM terminal_outputs WHERE created_at<now()-interval '24 hours'")
+        stale = conn.execute("SELECT id FROM terminal_sessions WHERE state IN ('opening','open','closing') AND last_activity_at<now()-interval '2 hours'").fetchall()
+        for row in stale:
+            self.close(str(row['id']))
         conn.execute("UPDATE terminal_sessions SET state='closed',updated_at=now() WHERE state IN ('opening','open','closing') AND last_activity_at<now()-interval '2 hours'")
 
     def shutdown(self):

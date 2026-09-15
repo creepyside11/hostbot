@@ -257,9 +257,9 @@ def main():
         with guard.transaction():
             recover(guard)
         threading.Thread(target=telegram, daemon=True).start()
-        print('Emerald Host: исполнитель запущен, GitHub auto-update и Docker PTY активны.', flush=True)
+        print('Emerald Host: исполнитель запущен, GitHub auto-update и system/Docker PTY активны.', flush=True)
         while not STOP.is_set():
-            guard.execute("INSERT INTO worker_health(id,heartbeat,version,supports_docker,supports_terminal) VALUES('nl',now(),'1.3.0',%s,%s) ON CONFLICT(id) DO UPDATE SET heartbeat=now(),version='1.3.0',supports_docker=EXCLUDED.supports_docker,supports_terminal=EXCLUDED.supports_terminal", (runner.docker is not None, runner.docker is not None))
+            guard.execute("INSERT INTO worker_health(id,heartbeat,version,supports_docker,supports_terminal) VALUES('nl',now(),'1.4.0',%s,%s) ON CONFLICT(id) DO UPDATE SET heartbeat=now(),version='1.4.0',supports_docker=EXCLUDED.supports_docker,supports_terminal=EXCLUDED.supports_terminal", (runner.docker is not None, terminal.available))
             flush_logs()
             terminal.tick(guard)
             for bot_id, code in runner.exited(exclude=active_bot_id if future and not future.done() else None):
