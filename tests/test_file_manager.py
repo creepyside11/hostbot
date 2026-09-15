@@ -45,7 +45,7 @@ class FileManagerTests(unittest.TestCase):
     def test_upload_binary_but_editor_rejects_binary(self):
         payload = base64.b64encode(b'\x00\x01\x02PNG').decode()
         result = self.request('upload', 'asset.bin', payload=payload)
-        self.assertEqual(result['size'], 7)
+        self.assertEqual(result['size'], 6)
         with self.assertRaisesRegex(ValueError, 'Бинарный'):
             self.request('read', 'asset.bin')
 
