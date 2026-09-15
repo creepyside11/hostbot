@@ -9,6 +9,7 @@ import private_repo_patch  # noqa: F401 - applies Runner patch on import
 from db_connection import connection_string, connect, operational_error_summary, validate_worker_database_url
 from file_manager import watch_forever as file_manager_watch_forever
 from sqlite_inspector import watch_forever as sqlite_watch_forever
+from user_discovery import watch_forever as user_discovery_watch_forever
 
 
 def wait_for_database():
@@ -44,4 +45,5 @@ def wait_for_database():
 wait_for_database()
 threading.Thread(target=sqlite_watch_forever, name='sqlite-inspector', daemon=True).start()
 threading.Thread(target=file_manager_watch_forever, name='file-manager', daemon=True).start()
+threading.Thread(target=user_discovery_watch_forever, name='sqlite-users', daemon=True).start()
 runpy.run_path('/opt/emerald/main.py', run_name='__main__')

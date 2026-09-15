@@ -14,6 +14,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install -r requirements.txt
-      - run: python -m py_compile main.py runner.py docker_backend.py terminal_bridge.py template_runner.py template_setup_funpay.py github_worker.py github_watch.py private_repo_patch.py sqlite_inspector.py file_manager.py db_connection.py launcher.py
+      - run: python -m py_compile main.py runner.py docker_backend.py terminal_bridge.py template_runner.py template_setup_funpay.py github_worker.py github_watch.py private_repo_patch.py sqlite_inspector.py file_manager.py user_discovery.py db_connection.py launcher.py
       - run: python -m unittest discover -s tests -p 'test_terminal_bridge.py' -v
       - run: python -m unittest discover -s tests -p 'test_file_manager.py' -v
+      - run: python -m unittest discover -s tests -p 'test_user_discovery.py' -v
