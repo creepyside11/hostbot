@@ -83,6 +83,8 @@ class RunnerTests(unittest.TestCase):
             env=r.environment(Path(tmp),{'BOT_TOKEN':'child-secret'})
             self.assertNotIn('DATABASE_URL',env)
             self.assertEqual(env['BOT_TOKEN'],'child-secret')
+            bot_env=r.environment(Path(tmp),{'BOT_TOKEN':'child-secret','DATABASE_URL':'postgresql://child:pass@host:5432/botdb'})
+            self.assertEqual(bot_env['DATABASE_URL'],'postgresql://child:pass@host:5432/botdb')
             self.assertEqual(redact('token=abc123',{'KEY':'abc123'}),'token=[СКРЫТО]')
 
     def test_install_local_requirement_start_stop_restart(self):
